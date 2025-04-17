@@ -485,18 +485,6 @@ def enable_manual_sharding(t: Union[torch.Tensor, XLAShardedTensor],
   t = torch_xla._XLAC._spmd_full_to_shard_shape(unwrap_sharded_tensor(t))
   return wrap_as_sharded_tensor(t)
 
-# @custom_op("xla::_spmd_full_to_shard_shape", mutates_args=())
-# def _spmd_full_to_shard_shape(t: torch.Tensor) -> torch.Tensor:
-#     return torch_xla._XLAC._spmd_full_to_shard_shape(t)
-# 
-# @_spmd_full_to_shard_shape.register_fake
-# def _(t: torch.Tensor) -> torch.Tensor:
-#   return torch.empty_like(t)
-
-PartitionSpec = tuple[Union[tuple[Union[int, str], ...], int, str, None], ...]
-
-# from torch_xla._XLAC import _spmd_full_to_shard_shape
-allowed_spmd_full_to_shard_shape = torch.compiler.allow_in_graph(torch_xla._XLAC._spmd_full_to_shard_shape)
 
 from typing import Optional, List, Tuple
 

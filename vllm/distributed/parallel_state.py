@@ -45,6 +45,7 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, resolve_obj_by_qualname,
                         supports_custom_op)
+import re
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1179,3 +1180,85 @@ def in_the_same_node_as(pg: Union[ProcessGroup, StatelessProcessGroup],
             aggregated_data += rank_data
 
     return [x == 1 for x in aggregated_data.tolist()]
+
+import os
+
+class GSPMDBackendTPU():
+    device_ids = []
+    mesh = None
+
+    def __init__(self):
+        spmd_inited = self._initialize_spmd()
+        if not spmd_inited:
+            return
+
+    
+
+    def _initialize_spmd(self):
+        global _mesh, _device_ids
+        if not self.is_spmd():
+            logger.warning(f'SPMD is not set')
+            return None
+        
+        import torch_xla.core.xla_model as xm
+        import torch_xla.runtime as xr
+        import torch_xla.distributed.spmd as xs
+        from torch_xla.distributed.spmd import Mesh
+        import numpy as np
+
+        xr.use_spmd()
+
+        num_devices = xr.global_runtime_device_count()
+        mesh_shape = (num_devices, )
+        # logger.info(f"hosseins: mesh_shape: [{mesh_shape=}]")
+        self.device_ids = np.array(range(num_devices))
+        self.mesh = Mesh(self.device_ids, mesh_shape, ('axis', ))
+        
+        logger.info(f'Initializing SPMD engine with mesh=[{self.mesh}]')
+        return True
+    
+    def is_spmd():
+        if "USE_SPMD" in os.environ and os.environ['USE_SPMD'] == "1":
+            return True
+        else:
+            return False
+
+    def get_partition_spec(self, t):
+        if not self.is_spmd(): 
+            return None
+        
+        shard_spec = self.get_shard_spec(t)
+        # logger.info(f"hosseins: get_partition_spec() -> [{shard_spec=}]")
+        match = re.search(r"\[([^\]]+)\]", shard_spec)
+        # # logger.info(f"hosseins: get_partition_spec() -> [{match=}]")
+
+        if not match:
+            return None
+
+        shard_map = match.group(1)
+        # # logger.info(f"hosseins: get_partition_spec() -> [{shard_map=}]")
+
+        shard_map_list = ast.literal_eval(f"[{shard_map}]")
+        # # logger.info(f"hosseins: get_partition_spec() -> [{shard_map_list=}]")
+        return_val = ()
+
+        if len(shard_map_list) == 0:
+            return_val = ()
+        
+        return_val = tuple([None if x == 1 else 'axis' for x in shard_map_list])
+        # # logger.info(f"hosseins: get_partition_spec() -> [{return_val=}]")
+
+        return return_val
+
+    def get_shard_spec(self, tensor, show_visual=False):
+        # # logger.info(f"hosseins: get_shard_spec() -> [{type(tensor)=}]")
+        if not self.is_spmd(): 
+            return None
+        
+        # xm.mark_step()
+        sharding = torch_xla._XLAC._get_xla_sharding_spec(tensor)
+        if show_visual:
+            # logger.info("hosseins: after sharding param")
+            visualize_tensor_sharding(tensor, use_color=False)
+            
+        return sharding
