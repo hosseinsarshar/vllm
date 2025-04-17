@@ -237,3 +237,60 @@ class SPMDBackend:
         except ValueError:
             # print("SPMDBackend: get_inferred_partition_spec() -> Error parsing device map numbers.") # Optional log
             return None
+
+    def _enable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str) -> torch.Tensor:
+        pass
+
+    def _disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]) -> torch.Tensor:
+        pass
+
+
+
+@custom_op("xla::enable_manual_sharding_wrapper", mutates_args=())
+def enable_manual_sharding_wrapper(tensor: torch.Tensor,
+                            partition_spec_str: str
+) -> torch.Tensor:
+    backend_instance = get_default_spmd_backend()
+    if not SPMDBackend.is_spmd(): return tensor
+    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+    try: partition_spec = eval(partition_spec_str)
+    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
+    # Call instance method via default instance
+    return SPMDBackend._enable_manual_sharding_logic(tensor, partition_spec)
+
+@enable_manual_sharding_wrapper.register_fake
+def enable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str):
+    # Fake logic (unchanged, doesn't need instance state)
+    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+    try: partition_spec = eval(partition_spec_str)
+    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str in fake: {partition_spec_str} - Error: {e}")
+    if not isinstance(partition_spec, tuple): raise TypeError(f"Parsed partition_spec must be a tuple, got {type(partition_spec)}")
+    if len(tensor.shape) != len(partition_spec): raise ValueError(f"Tensor rank {len(tensor.shape)} and partition_spec length {len(partition_spec)} must match. Shape={tensor.shape}, Spec={partition_spec_str}")
+    num_devices_for_fake = 4 # Still potentially unreliable assumption
+    ret_shape = list(tensor.shape)
+    for i, spec_dim in enumerate(partition_spec):
+        if spec_dim is not None:
+                if ret_shape[i] % num_devices_for_fake != 0: print(f"SPMDBackend Fake Warning: Dim {i} size {ret_shape[i]} not divisible by fake device count {num_devices_for_fake}.")
+                ret_shape[i] //= num_devices_for_fake # Use floor division
+    return torch.empty(tuple(ret_shape), dtype=tensor.dtype, device=tensor.device)
+
+@custom_op("xla::disable_manual_sharding_wrapper", mutates_args=())
+def disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]) -> torch.Tensor:
+    backend_instance = get_default_spmd_backend()
+    if not SPMDBackend.is_spmd(): return tensor
+    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+    if full_shape is None: raise ValueError("full_shape cannot be None")
+    try: partition_spec = eval(partition_spec_str)
+    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
+    full_shape_tuple = tuple(full_shape)
+    # Call instance method via default instance
+    return SPMDBackend._disable_manual_sharding_logic(tensor, partition_spec, full_shape_tuple)
+
+@disable_manual_sharding_wrapper.register_fake
+def disable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]):
+    # Fake logic (unchanged)
+    if full_shape is None: raise ValueError("full_shape cannot be None")
+    if not isinstance(full_shape, (list, tuple)) or not all(isinstance(dim, int) for dim in full_shape):
+        raise TypeError(f"full_shape must be a list or tuple of integers, got {full_shape}")
+    return torch.empty(tuple(full_shape), dtype=tensor.dtype, device=tensor.device)
+
