@@ -238,12 +238,57 @@ class SPMDBackend:
             # print("SPMDBackend: get_inferred_partition_spec() -> Error parsing device map numbers.") # Optional log
             return None
 
-    def _enable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str) -> torch.Tensor:
-        pass
+    def _enable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec) -> torch.Tensor:
+        """Internal logic for enabling manual sharding, called by the external wrapper."""
+        if not SPMDBackend.is_spmd():
+            return tensor
 
-    def _disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]) -> torch.Tensor:
-        pass
+        mesh = self.get_mesh()
+        if mesh is None:
+            print("SPMDBackend Warning: No mesh available for enable_manual_sharding.")
+            # Decide on behavior: return tensor as is or raise error?
+            return tensor # Or raise RuntimeError("SPMD mesh not initialized")
 
+        # Imports needed
+        import torch_xla.distributed.spmd as xs
+
+        # Use the official xs.enable_manual_sharding
+        sharded_obj = xs.enable_manual_sharding(tensor, partition_spec=partition_spec, mesh=mesh)
+
+        # Return the underlying tensor
+        return self.unwrap_sharded_tensor(sharded_obj)
+
+    def _disable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec, full_shape: Tuple[int, ...]) -> torch.Tensor:
+        """Internal logic for disabling manual sharding, called by the external wrapper."""
+        if not SPMDBackend.is_spmd():
+            return tensor
+
+        mesh = self.get_mesh()
+        if mesh is None:
+            print("SPMDBackend Warning: No mesh available for disable_manual_sharding.")
+            return tensor # Or raise RuntimeError("SPMD mesh not initialized")
+
+        # Imports needed
+        import torch_xla.distributed.spmd as xs
+
+        # Use the official xs.disable_manual_sharding
+        # Assumes input `tensor` is the local shard tensor.
+        unsharded_obj = xs.disable_manual_sharding(tensor,
+                                                  partition_spec=partition_spec,
+                                                  full_shape=full_shape,
+                                                  mesh=mesh)
+
+        # Return the underlying tensor
+        return self.unwrap_sharded_tensor(unsharded_obj)
+
+
+def get_default_spmd_backend() -> SPMDBackend:
+    """Gets or creates the default SPMDBackend instance."""
+    global _default_spmd_backend_instance
+    if _default_spmd_backend_instance is None:
+        print("Creating default SPMDBackend instance...")
+        _default_spmd_backend_instance = SPMDBackend()
+    return _default_spmd_backend_instance
 
 
 @custom_op("xla::enable_manual_sharding_wrapper", mutates_args=())
@@ -256,7 +301,8 @@ def enable_manual_sharding_wrapper(tensor: torch.Tensor,
     try: partition_spec = eval(partition_spec_str)
     except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
     # Call instance method via default instance
-    return SPMDBackend._enable_manual_sharding_logic(tensor, partition_spec)
+    return backend_instance._enable_manual_sharding_logic(tensor, partition_spec)
+
 
 @enable_manual_sharding_wrapper.register_fake
 def enable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str):
@@ -284,7 +330,8 @@ def disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: st
     except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
     full_shape_tuple = tuple(full_shape)
     # Call instance method via default instance
-    return SPMDBackend._disable_manual_sharding_logic(tensor, partition_spec, full_shape_tuple)
+    return backend_instance._disable_manual_sharding_logic(tensor, partition_spec, full_shape_tuple)
+
 
 @disable_manual_sharding_wrapper.register_fake
 def disable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]):

@@ -86,7 +86,3 @@ class TpuCommunicator(DeviceCommunicatorBase):
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         assert dim == -1, "TPUs only support dim=-1 for all-gather."
         return xm.all_gather(input_, dim=dim)
-
-
-class SPMDBackend():
-    
