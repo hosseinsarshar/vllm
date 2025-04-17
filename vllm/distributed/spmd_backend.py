@@ -183,22 +183,6 @@ class SPMDBackend:
             print(f"SPMDBackend: Error getting sharding spec string: {e}")
             return None
 
-    def unwrap_sharded_tensor(self, t: Union[torch.Tensor, 'XLAShardedTensor']) -> torch.Tensor:
-        """Extracts the underlying global tensor if input is XLAShardedTensor."""
-        if SPMDBackend.is_spmd():
-            from torch_xla.distributed.spmd import XLAShardedTensor
-            if isinstance(t, XLAShardedTensor):
-                return t.global_tensor
-        return t
-
-    def wrap_as_sharded_tensor(self, t: torch.Tensor) -> Union[torch.Tensor, 'XLAShardedTensor']:
-        """Wraps a tensor as XLAShardedTensor if SPMD is active."""
-        if SPMDBackend.is_spmd():
-            from torch_xla.distributed.spmd import XLAShardedTensor
-            if not isinstance(t, XLAShardedTensor):
-                return XLAShardedTensor(t)
-        return t
-
     def get_inferred_partition_spec(self, t: torch.Tensor) -> Optional[PartitionSpec]:
         """
         Attempts to infer the PartitionSpec tuple from the tensor's sharding spec string.
@@ -253,42 +237,3 @@ class SPMDBackend:
         except ValueError:
             # print("SPMDBackend: get_inferred_partition_spec() -> Error parsing device map numbers.") # Optional log
             return None
-
-
-    # --- Internal Logic for Custom Ops ---
-
-    def _enable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec) -> torch.Tensor:
-        """Internal logic for enabling manual sharding, called by the external wrapper."""
-        if not SPMDBackend.is_spmd():
-            return tensor
-
-        # Use the mesh property
-        if self.mesh is None:
-            print("SPMDBackend Warning: No mesh available for enable_manual_sharding.")
-            # Consider raising an error for clearer failure
-            raise RuntimeError("SPMDBackend mesh not initialized, cannot enable manual sharding.")
-            # return tensor # Alternative: return unmodified tensor
-
-        import torch_xla.distributed.spmd as xs
-        sharded_obj = xs.enable_manual_sharding(tensor, partition_spec=partition_spec, mesh=self.mesh)
-        return self.unwrap_sharded_tensor(sharded_obj)
-
-    def _disable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec, full_shape: Tuple[int, ...]) -> torch.Tensor:
-        """Internal logic for disabling manual sharding, called by the external wrapper."""
-        if not SPMDBackend.is_spmd():
-            return tensor
-
-        # Use the mesh property
-        if self.mesh is None:
-            print("SPMDBackend Warning: No mesh available for disable_manual_sharding.")
-            raise RuntimeError("SPMDBackend mesh not initialized, cannot disable manual sharding.")
-            # return tensor # Alternative: return unmodified tensor
-
-        import torch_xla.distributed.spmd as xs
-        # Assumes input `tensor` is the local shard tensor.
-        unsharded_obj = xs.disable_manual_sharding(tensor,
-                                                  partition_spec=partition_spec,
-                                                  full_shape=full_shape,
-                                                  mesh=self.mesh) # Use instance mesh
-        return self.unwrap_sharded_tensor(unsharded_obj)
-
