@@ -451,6 +451,7 @@ class _ModelRegistry:
         self,
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
+        breakpoint()
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
