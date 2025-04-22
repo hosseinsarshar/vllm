@@ -1,12 +1,20 @@
 import os
-import re
-import ast
 import time
-import numpy as np
 import torch
+import numpy as np
+from vllm.logger import init_logger
+from torch.library import impl, custom_op
 from typing import Union, Tuple, Optional, List
-
+from vllm.model_executor.layers.linear import (RowParallelLinear,
+                                               ColumnParallelLinear)
+from vllm.v1.worker.tpu_model_runner import TPUModelRunner
+from vllm.v1.attention.backends.pallas import PallasAttentionBackendImpl
+import functools
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 # Define Type Alias at module level
+
+logger = init_logger(__name__)
+
 PartitionSpec = tuple[Union[tuple[Union[int, str], ...], int, str, None], ...]
 
 # --- Conditional Torch/XLA Imports ---
@@ -17,21 +25,12 @@ try:
     import torch_xla.distributed.spmd as xs
     from torch_xla.distributed.spmd import Mesh
     from torch_xla.distributed.spmd import XLAShardedTensor
-    from torch.library import impl, custom_op
-    # from torch_xla.experimental.spmd_fully_sharded_data_parallel import visualize_tensor_sharding # Optional import
     TORCH_XLA_AVAILABLE = True
-    # Allow graph break for the underlying XLA call if using torch.compile
-    # Name follows convention, though long. Keeping it for clarity on what it allows.
-    allowed_spmd_full_to_shard_shape = torch.compiler.allow_in_graph(torch_xla._XLAC._spmd_full_to_shard_shape)
 
 except ImportError:
     TORCH_XLA_AVAILABLE = False
-    # Define dummy types/functions if torch_xla is not available
-    class DummyMesh: pass
-    class DummyXLAShardedTensor: pass
-    Mesh = DummyMesh
-    XLAShardedTensor = DummyXLAShardedTensor
-    custom_op = lambda *args, **kwargs: (lambda f: f) # Dummy decorator
+    class Mesh: pass
+    class XLAShardedTensor: pass
     # Define dummy placeholders if needed
     # ...
 
@@ -47,14 +46,16 @@ class SPMDBackend:
         col_parallel_spec (PartitionSpec): Standard partition spec for column parallelism. Read-only property.
         row_parallel_spec (PartitionSpec): Standard partition spec for row parallelism. Read-only property.
     """
+    _mesh: Optional["Mesh"] = None
+    _device_ids: Optional[np.ndarray] = np.array(list(range(0, 4)))
 
     def __init__(self):
         """
         Initializes the SPMDBackend instance. Attempts to initialize
         the SPMD environment if enabled based on `is_spmd()`.
         """
-        self._mesh: Optional[Mesh] = None
-        self._device_ids: Optional[np.ndarray] = None
+        self._mesh: Optional["Mesh"] = None
+        self._device_ids: Optional[np.ndarray] = np.array(list(range(0, 4)))
         # print("SPMDBackend: Instance created. Attempting initialization...") # Optional log
         self._initialize_spmd()
 
@@ -69,7 +70,6 @@ class SPMDBackend:
         Sets internal instance attributes _mesh and _device_ids. Called during __init__.
         """
         if not SPMDBackend.is_spmd():
-            # print("SPMDBackend: SPMD not enabled or torch_xla not available, skipping initialization.") # Optional log
             return
 
         # Imports required for initialization
@@ -79,30 +79,28 @@ class SPMDBackend:
         from torch_xla.distributed.spmd import Mesh
         import numpy as np
 
-        # print("SPMDBackend: Using SPMD execution. Initializing...") # Optional log
+        logger.info("SPMDBackend: Using SPMD execution. Initializing...") # Optional log
         try:
             xr.use_spmd() # Configure runtime for SPMD
             num_devices = xr.global_runtime_device_count()
             if num_devices == 0:
-                print("SPMDBackend Warning: global_runtime_device_count is 0. Cannot initialize SPMD mesh.")
+                logger.warning("SPMDBackend Warning: global_runtime_device_count is 0. Cannot initialize SPMD mesh.")
                 self._device_ids = np.array([])
                 self._mesh = None
                 return
 
             mesh_shape = (num_devices,)
-            device_ids_np = np.array(range(num_devices))
-            self._device_ids = device_ids_np # Set internal attribute
+            self._device_ids = np.array(range(num_devices))
 
             self._mesh = Mesh(self._device_ids, mesh_shape, ('axis',)) # Set internal attribute
-            print(f'SPMDBackend: Initialized SPMD engine with mesh=[{self._mesh}]') # Keep success message
-
+            logger.info(f'SPMDBackend: Initialized SPMD engine with mesh=[{self._mesh}]') # Keep success message
+            self.apply_spmd_patches()
+            
         except Exception as e:
-            print(f"SPMDBackend: Error during initialization: {e}")
-            self._mesh = None
-            self._device_ids = None # Reset on failure
+            raise RuntimeError(f"SPMDBackend: Error during initialization: {e}")
 
     @property
-    def mesh(self) -> Optional[Mesh]:
+    def mesh(self) -> Optional["Mesh"]:
         """Returns the initialized SPMD mesh associated with this instance (read-only)."""
         return self._mesh
 
@@ -111,22 +109,27 @@ class SPMDBackend:
         """Returns the NumPy array of device IDs associated with this instance (read-only)."""
         return self._device_ids
 
-    @property
-    def col_parallel_spec(self) -> PartitionSpec:
+    @staticmethod
+    def col_parallel_spec() -> PartitionSpec:
         """Returns the standard partition spec for column-parallel sharding (read-only)."""
         return ('axis', None)
 
-    @property
-    def row_parallel_spec(self) -> PartitionSpec:
+    @staticmethod
+    def row_parallel_spec() -> PartitionSpec:
         """Returns the standard partition spec for row-parallel sharding (read-only)."""
         return (None, 'axis')
+
+    @staticmethod
+    def kv_cache_parallel_spec() -> PartitionSpec:
+        """Returns the standard partition spec for row-parallel sharding (read-only)."""
+        return (None, None, 'axis', None)
 
     def shard_spmd(self,
                    data: torch.Tensor,
                    partition_spec: PartitionSpec,
-                   mesh: Optional[Mesh] = None, # Allow overriding instance mesh
-                   show_visual: bool = False, # Optional visualization hook
-                   print_shard: bool = False) -> None: # Optional print hook
+                   mesh: Optional["Mesh"] = None, # Allow overriding instance mesh
+                   print_shard: bool = False,
+                   mark_step=True) -> None: # Optional print hook
         """
         Applies the specified sharding partition_spec to the data tensor.
         Uses the instance's mesh by default. Does nothing if SPMD is not
@@ -137,105 +140,36 @@ class SPMDBackend:
         if not isinstance(data, torch.Tensor):
              raise TypeError("Object to shard must be a torch.Tensor")
 
-        # Imports needed for sharding
-        import torch_xla.core.xla_model as xm
-        import torch_xla.distributed.spmd as xs
-        # from torch_xla.experimental.spmd_fully_sharded_data_parallel import visualize_tensor_sharding
-
         # Use provided mesh or fall back to instance's mesh property
         active_mesh = mesh if mesh is not None else self.mesh
         if active_mesh is None:
-            print("SPMDBackend Warning: No mesh available for sharding.")
-            return
+            raise RuntimeError(f"SPMDBackend Error: No mesh available for sharding")
 
         xs.mark_sharding(data, active_mesh, partition_spec)
-        xm.mark_step() # Ensure the sharding operation is processed
+        if mark_step:
+            xm.mark_step() # Ensure the sharding operation is processed
 
-        if show_visual or print_shard:
-             xm.mark_step() # Might be needed before getting spec
-             try:
-                 sharding_str = self.get_shard_spec_string(data) # Use the specific getter
-                 if print_shard and sharding_str:
-                     print(f"SPMDBackend: shard_spmd() -> Sharding Spec String: [{sharding_str}]")
-                 # if show_visual:
-                 #     visualize_tensor_sharding(data, use_color=False) # Requires import
-             except Exception as e:
-                 print(f"SPMDBackend: Could not get/visualize sharding spec: {e}")
+        if print_shard:
+            try:
+               sharding_str = SPMDBackend.get_shard_spec_string(data) # Use the specific getter
+               logger.info(f"SPMDBackend: shard_spmd() -> Sharding Spec String: [{sharding_str}]")
+            except Exception as e:
+               logger.error(f"SPMDBackend: Could not get sharding spec: {e}")
 
-    def get_shard_spec_string(self, tensor: torch.Tensor, show_visual: bool = False) -> Optional[str]:
+    @staticmethod
+    def get_shard_spec_string(tensor: torch.Tensor) -> Optional[str]:
         """
         Retrieves the raw XLA sharding specification string for a tensor.
         Returns None if SPMD is not enabled or retrieval fails.
         """
         if not SPMDBackend.is_spmd():
             return None
-
-        # Imports needed
-        import torch_xla.core.xla_model as xm
-        # from torch_xla.experimental.spmd_fully_sharded_data_parallel import visualize_tensor_sharding
-
+        xm.mark_step()
         try:
             sharding_str = torch_xla._XLAC._get_xla_sharding_spec(tensor)
-            # if show_visual:
-            #     visualize_tensor_sharding(tensor, use_color=False) # Requires import
             return sharding_str
         except Exception as e:
-            print(f"SPMDBackend: Error getting sharding spec string: {e}")
-            return None
-
-    def get_inferred_partition_spec(self, t: torch.Tensor) -> Optional[PartitionSpec]:
-        """
-        Attempts to infer the PartitionSpec tuple from the tensor's sharding spec string.
-        This parsing is based on common patterns and might be inaccurate for complex cases.
-        Returns None if SPMD is not enabled, spec cannot be retrieved, or parsing fails.
-        """
-        if not SPMDBackend.is_spmd():
-            return None
-
-        shard_spec_str = self.get_shard_spec_string(t) # Use specific getter
-        if shard_spec_str is None:
-            # print("SPMDBackend: get_inferred_partition_spec() -> Could not get shard spec string.") # Optional log
-            return None
-
-        # --- Parsing Logic (same potentially fragile logic as before) ---
-        # print(f"SPMDBackend: get_inferred_partition_spec() -> Input shard_spec: [{shard_spec_str=}]") # Debugging
-        match = re.search(r"devices=\[(\d+),(\d+)\]", shard_spec_str) # Try matching 2D device mapping
-        if not match:
-             # Check for replicated case
-             if "{replicated}" in shard_spec_str:
-                  # Assume replicated means None across all dimensions
-                  return tuple([None] * t.dim())
-
-             # Check for single-axis sharding pattern like T(i)
-             match_single_axis = re.search(r"T\((\d)\)", shard_spec_str)
-             if match_single_axis and t.dim() > 0:
-                 try:
-                     sharded_axis_index = int(match_single_axis.group(1))
-                     spec = [None] * t.dim()
-                     if 0 <= sharded_axis_index < t.dim():
-                          spec[sharded_axis_index] = 'axis'
-                          # print(f"SPMDBackend: get_inferred_partition_spec() -> Parsed from T({sharded_axis_index}): {tuple(spec)}") # Debugging
-                          return tuple(spec)
-                 except (ValueError, IndexError):
-                     pass # Ignore parsing errors here
-
-             # print("SPMDBackend: get_inferred_partition_spec() -> Could not parse known sharding format.") # Optional log
-             return None # Cannot parse known patterns
-
-        # If matched devices=[A,B] pattern (likely assumes 1D mesh, 2D tensor mapping)
-        try:
-            # This logic assumes the numbers correspond directly to tensor dimensions
-            # and a value of 1 means 'not sharded' (None) along that axis.
-            shard_map_list = [int(d) for d in match.groups()]
-            # Basic check: does number of dims in mapping match tensor dims?
-            # if len(shard_map_list) != t.dim():
-            #     print(f"SPMDBackend Warning: Parsed device map dim ({len(shard_map_list)}) != tensor dim ({t.dim()}). Inference might be wrong.")
-                # Decide how to handle mismatch - returning spec based on map length for now
-            return_val = tuple([None if x == 1 else 'axis' for x in shard_map_list])
-            # print(f"SPMDBackend: get_inferred_partition_spec() -> Derived from devices=[...]: [{return_val=}]") # Debugging
-            return return_val
-        except ValueError:
-            # print("SPMDBackend: get_inferred_partition_spec() -> Error parsing device map numbers.") # Optional log
+            logger.error(f"SPMDBackend: Error getting sharding spec string: {e}")
             return None
 
     def _enable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec) -> torch.Tensor:
@@ -243,101 +177,176 @@ class SPMDBackend:
         if not SPMDBackend.is_spmd():
             return tensor
 
-        mesh = self.get_mesh()
+        mesh = self.mesh
         if mesh is None:
-            print("SPMDBackend Warning: No mesh available for enable_manual_sharding.")
-            # Decide on behavior: return tensor as is or raise error?
-            return tensor # Or raise RuntimeError("SPMD mesh not initialized")
+            raise RuntimeError("SPMDBackend Error: No mesh available for enable_manual_sharding.")
 
-        # Imports needed
-        import torch_xla.distributed.spmd as xs
-
-        # Use the official xs.enable_manual_sharding
-        sharded_obj = xs.enable_manual_sharding(tensor, partition_spec=partition_spec, mesh=mesh)
-
-        # Return the underlying tensor
-        return self.unwrap_sharded_tensor(sharded_obj)
+        return xs.enable_manual_sharding(tensor, partition_spec=partition_spec, mesh=mesh).global_tensor
 
     def _disable_manual_sharding_logic(self, tensor: torch.Tensor, partition_spec: PartitionSpec, full_shape: Tuple[int, ...]) -> torch.Tensor:
         """Internal logic for disabling manual sharding, called by the external wrapper."""
         if not SPMDBackend.is_spmd():
             return tensor
 
-        mesh = self.get_mesh()
+        mesh = self.mesh
         if mesh is None:
-            print("SPMDBackend Warning: No mesh available for disable_manual_sharding.")
-            return tensor # Or raise RuntimeError("SPMD mesh not initialized")
+            raise RuntimeError("SPMDBackend Error: No mesh available for disable_manual_sharding.")
 
-        # Imports needed
-        import torch_xla.distributed.spmd as xs
+        return xs.disable_manual_sharding(tensor, partition_spec=partition_spec, 
+                                          full_shape=tuple(full_shape), mesh=mesh).global_tensor
+    
+    @staticmethod
+    def patch_init(cls):
+        original_init = cls["class_name"].__init__
+        partition_spec = cls["partition_spec"]
 
-        # Use the official xs.disable_manual_sharding
-        # Assumes input `tensor` is the local shard tensor.
-        unsharded_obj = xs.disable_manual_sharding(tensor,
-                                                  partition_spec=partition_spec,
-                                                  full_shape=full_shape,
-                                                  mesh=mesh)
+        @functools.wraps(original_init)
+        def wrapped_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
 
-        # Return the underlying tensor
-        return self.unwrap_sharded_tensor(unsharded_obj)
+            if hasattr(self, 'quant_method') and self.quant_method is not None:
+                _spmd_backend = spmd_backend()
+                _spmd_backend.shard_spmd(self.weight, partition_spec=partition_spec)
+            else:
+                pass
+
+        cls["class_name"].__init__ = wrapped_init
+        print(f"Patched __init__ for {cls['class_name'].__name__}")
+
+    @staticmethod
+    def patch_kv_cache():
+        original_create_kv_cache = TPUModelRunner.create_kv_cache
+
+        @functools.wraps(original_create_kv_cache)
+        def wrapped_create_kv_cache(self, *args, **kwargs) -> dict[str, torch.Tensor]:
+            print("hosseins: calling the original_create_kv_cache()")
+            kv_caches = original_create_kv_cache(self, *args, **kwargs)
+            
+            _spmd_backend = spmd_backend()
+            for layer in kv_caches:
+                kv_cache = kv_caches[layer]
+                print(f"hosseins: [{layer=}]:[{type(kv_cache)=}]")
+                print(f"hosseins: [{layer=}]:[{type(kv_cache)=}] - [{kv_cache.shape=}]")
+                time.sleep(1)
+                _spmd_backend.shard_spmd(kv_cache, partition_spec=SPMDBackend.kv_cache_parallel_spec(), mark_step=False)
+            
+            xm.mark_step()
+            print("hosseins: create_kv_cache() is completed")
+            return kv_caches
+
+        TPUModelRunner.create_kv_cache = wrapped_create_kv_cache
+        logger.info(f"Patched create_kv_cache for TPUModelRunner")
+
+    @staticmethod
+    def patch_pallas_forward():
+        original_forward = PallasAttentionBackendImpl.forward
+
+        @functools.wraps(original_forward)
+        def wrapped_forward(self, *args, **kwargs):
+            kwargs["key"] = enable_manual_sharding_wrapper(kwargs["key"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            kwargs["query"] = enable_manual_sharding_wrapper(kwargs["query"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            kwargs["value"] = enable_manual_sharding_wrapper(kwargs["value"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            kwargs["kv_cache"] = enable_manual_sharding_wrapper(kwargs["kv_cache"], partition_spec_str=f"{SPMDBackend.kv_cache_parallel_spec()}")
+
+            local_output = original_forward(self, *args, **kwargs)
+
+            _spmd_backend = spmd_backend()
+
+            merged_output = disable_manual_sharding_wrapper(tensor=local_output, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}", full_shape=[local_output.shape[0], local_output.shape[0] * len(_spmd_backend.device_ids)])
+            return merged_output
+
+        PallasAttentionBackendImpl.forward = wrapped_forward
+        logger.info(f"Patched PallasAttentionBackendImpl.forward")
+
+    def apply_spmd_patches(self):
+        cls_to_patch_on_weight_create = [
+            {
+                "class_name": RowParallelLinear,
+                "partition_spec": SPMDBackend.row_parallel_spec()
+            }, {
+                "class_name": ColumnParallelLinear, 
+                "partition_spec": SPMDBackend.col_parallel_spec()
+            }, {
+                "class_name": VocabParallelEmbedding, 
+                "partition_spec": SPMDBackend.col_parallel_spec()
+            }
+        ]
+
+        for cls in cls_to_patch_on_weight_create:
+            SPMDBackend.patch_init(cls)
+
+        SPMDBackend.patch_kv_cache()
+        # SPMDBackend.patch_pallas_forward()
 
 
-def get_default_spmd_backend() -> SPMDBackend:
+_SPMD_BACKEND: Optional[SPMDBackend] = None
+
+
+def spmd_backend() -> SPMDBackend:
     """Gets or creates the default SPMDBackend instance."""
-    global _default_spmd_backend_instance
-    if _default_spmd_backend_instance is None:
-        print("Creating default SPMDBackend instance...")
-        _default_spmd_backend_instance = SPMDBackend()
-    return _default_spmd_backend_instance
+    if not SPMDBackend.is_spmd():
+        return None
+    
+    print(f"hosseins: spmd_backend-> [{_SPMD_BACKEND=}]")
+    assert _SPMD_BACKEND is not None, ("SPMD Backend is not initialized")
+    return _SPMD_BACKEND
+
+def init_spmd_backend() -> SPMDBackend:
+    global _SPMD_BACKEND
+    _SPMD_BACKEND = SPMDBackend()
+    print(f"hosseins: init_spmd_backend-> [{_SPMD_BACKEND=}]")
+    return _SPMD_BACKEND
+
+if TORCH_XLA_AVAILABLE:
+
+    @custom_op("xla::enable_manual_sharding_wrapper", mutates_args=())
+    def enable_manual_sharding_wrapper(tensor: torch.Tensor,
+                                partition_spec_str: str
+    ) -> torch.Tensor:
+        backend_instance = spmd_backend()
+        if not SPMDBackend.is_spmd(): return tensor
+        if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+        try: partition_spec = eval(partition_spec_str)
+        except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
+        # Call instance method via default instance
+        return backend_instance._enable_manual_sharding_logic(tensor, partition_spec)
 
 
-@custom_op("xla::enable_manual_sharding_wrapper", mutates_args=())
-def enable_manual_sharding_wrapper(tensor: torch.Tensor,
-                            partition_spec_str: str
-) -> torch.Tensor:
-    backend_instance = get_default_spmd_backend()
-    if not SPMDBackend.is_spmd(): return tensor
-    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
-    try: partition_spec = eval(partition_spec_str)
-    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
-    # Call instance method via default instance
-    return backend_instance._enable_manual_sharding_logic(tensor, partition_spec)
+    @enable_manual_sharding_wrapper.register_fake
+    def enable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str):
+        # Fake logic (unchanged, doesn't need instance state)
+        if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+        try: partition_spec = eval(partition_spec_str)
+        except Exception as e: raise ValueError(f"Failed to eval partition_spec_str in fake: {partition_spec_str} - Error: {e}")
+        if not isinstance(partition_spec, tuple): raise TypeError(f"Parsed partition_spec must be a tuple, got {type(partition_spec)}")
+        if len(tensor.shape) != len(partition_spec): raise ValueError(f"Tensor rank {len(tensor.shape)} and partition_spec length {len(partition_spec)} must match. Shape={tensor.shape}, Spec={partition_spec_str}")
+        num_devices_for_fake = len(_SPMD_BACKEND.device_ids) if _SPMD_BACKEND else 4
+        ret_shape = list(tensor.shape)
+
+        ret_shape = tuple([(x if partition_spec[i] is None else x // num_devices_for_fake) for i, x in enumerate(tensor.shape)])
+        tensor = torch.empty(ret_shape, dtype=tensor.dtype, device=tensor.device)
+
+        return tensor
 
 
-@enable_manual_sharding_wrapper.register_fake
-def enable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str):
-    # Fake logic (unchanged, doesn't need instance state)
-    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
-    try: partition_spec = eval(partition_spec_str)
-    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str in fake: {partition_spec_str} - Error: {e}")
-    if not isinstance(partition_spec, tuple): raise TypeError(f"Parsed partition_spec must be a tuple, got {type(partition_spec)}")
-    if len(tensor.shape) != len(partition_spec): raise ValueError(f"Tensor rank {len(tensor.shape)} and partition_spec length {len(partition_spec)} must match. Shape={tensor.shape}, Spec={partition_spec_str}")
-    num_devices_for_fake = 4 # Still potentially unreliable assumption
-    ret_shape = list(tensor.shape)
-    for i, spec_dim in enumerate(partition_spec):
-        if spec_dim is not None:
-                if ret_shape[i] % num_devices_for_fake != 0: print(f"SPMDBackend Fake Warning: Dim {i} size {ret_shape[i]} not divisible by fake device count {num_devices_for_fake}.")
-                ret_shape[i] //= num_devices_for_fake # Use floor division
-    return torch.empty(tuple(ret_shape), dtype=tensor.dtype, device=tensor.device)
-
-@custom_op("xla::disable_manual_sharding_wrapper", mutates_args=())
-def disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]) -> torch.Tensor:
-    backend_instance = get_default_spmd_backend()
-    if not SPMDBackend.is_spmd(): return tensor
-    if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
-    if full_shape is None: raise ValueError("full_shape cannot be None")
-    try: partition_spec = eval(partition_spec_str)
-    except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
-    full_shape_tuple = tuple(full_shape)
-    # Call instance method via default instance
-    return backend_instance._disable_manual_sharding_logic(tensor, partition_spec, full_shape_tuple)
+    @custom_op("xla::disable_manual_sharding_wrapper", mutates_args=())
+    def disable_manual_sharding_wrapper(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]) -> torch.Tensor:
+        backend_instance = spmd_backend()
+        if not SPMDBackend.is_spmd(): return tensor
+        if partition_spec_str is None: raise ValueError("partition_spec_str cannot be None")
+        if full_shape is None: raise ValueError("full_shape cannot be None")
+        try: partition_spec = eval(partition_spec_str)
+        except Exception as e: raise ValueError(f"Failed to eval partition_spec_str: {partition_spec_str} - Error: {e}")
+        full_shape_tuple = tuple(full_shape)
+        # Call instance method via default instance
+        return backend_instance._disable_manual_sharding_logic(tensor, partition_spec, full_shape_tuple)
 
 
-@disable_manual_sharding_wrapper.register_fake
-def disable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]):
-    # Fake logic (unchanged)
-    if full_shape is None: raise ValueError("full_shape cannot be None")
-    if not isinstance(full_shape, (list, tuple)) or not all(isinstance(dim, int) for dim in full_shape):
-        raise TypeError(f"full_shape must be a list or tuple of integers, got {full_shape}")
-    return torch.empty(tuple(full_shape), dtype=tensor.dtype, device=tensor.device)
+    @disable_manual_sharding_wrapper.register_fake
+    def disable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]):
+        # Fake logic (unchanged)
+        if full_shape is None: raise ValueError("full_shape cannot be None")
+        if not isinstance(full_shape, (list, tuple)) or not all(isinstance(dim, int) for dim in full_shape):
+            raise TypeError(f"full_shape must be a list or tuple of integers, got {full_shape}")
+        return torch.empty(tuple(full_shape), dtype=tensor.dtype, device=tensor.device)
 

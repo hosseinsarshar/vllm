@@ -45,11 +45,9 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, resolve_obj_by_qualname,
                         supports_custom_op)
-import re
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-
 
 @dataclass
 class GraphCaptureContext:

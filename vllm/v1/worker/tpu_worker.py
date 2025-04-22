@@ -24,7 +24,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.tpu_model_runner import TPUModelRunner
 
-from vllm.distributed.utils import initialize_spmd
+from vllm.distributed.tpu_gspmd_backend import init_spmd_backend
 from vllm.utils import get_tpu_info
 import time
 
@@ -58,8 +58,7 @@ class TPUWorker:
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
-        initialize_spmd()
-
+        
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
         else:
@@ -86,8 +85,8 @@ class TPUWorker:
                         self.profile_dir)
             self.profiler = xp.start_server(9012)
             # print(f"hosseins: starting the profile at [{envs.VLLM_TORCH_PROFILER_DIR}]")
-            duration_ms = 400000
-            xp.trace_detached(f'localhost:{9012}', envs.VLLM_TORCH_PROFILER_DIR, duration_ms=duration_ms)
+            # duration_ms = 400000
+            # xp.trace_detached(f'localhost:{9012}', envs.VLLM_TORCH_PROFILER_DIR, duration_ms=duration_ms)
 
         if self.model_config.seed is None:
             self.model_config.seed = 0
@@ -140,7 +139,7 @@ class TPUWorker:
     def determine_available_memory(self) -> int:
         kv_caches: dict[str, torch.Tensor] = {}
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        # print(f"hosseins: [{kv_cache_spec=}]")
+        print(f"hosseins: [{kv_cache_spec=}]")
         for layer_name, layer_spec in kv_cache_spec.items():
             if isinstance(layer_spec, FullAttentionSpec):
                 dtype = layer_spec.dtype
@@ -154,17 +153,19 @@ class TPUWorker:
                 kv_caches[layer_name] = tpu_kv_cache
             else:
                 raise NotImplementedError
-
+        print(f"hosseins: 3")
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             runner_kv_caches)
+        print(f"hosseins: 4")
 
         self.model_runner._dummy_run(
             runner_kv_caches,
             num_tokens=self.scheduler_config.max_num_batched_tokens,
         )
+        print(f"hosseins: 5")
 
         # Synchronize before measuring the memory usage.
         xm.wait_device_ops()
@@ -174,6 +175,8 @@ class TPUWorker:
         m = get_tpu_info(0)
         total_memory_size = m["bytes_limit"]
         current_mem = m["bytes_used"]
+        print(f"hosseins: [{current_mem=}]")
+
         # Ideally we would use profiled = m["peak_bytes_used"] to
         # get weights + activations. But there is memory used during
         # compilation / weight loading that impacts the peak and
@@ -184,7 +187,9 @@ class TPUWorker:
         # Calculate the TPU KV cache size based on profiling.
         usable_memory_size = int(total_memory_size *
                                  self.cache_config.gpu_memory_utilization)
+        print(f"hosseins: [{usable_memory_size=}]")
         tpu_kv_cache_bytes = max(usable_memory_size - profiled, 0)
+        print(f"hosseins: [{tpu_kv_cache_bytes=}]")
 
         return int(tpu_kv_cache_bytes)
 
@@ -255,3 +260,6 @@ def init_tpu_worker_distributed_environment(
     )
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+
+    # SPMD Backend is a new experimental feature - it is not active by default, you can activate it by setting USE_SPMD=1
+    init_spmd_backend()

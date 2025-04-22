@@ -17,7 +17,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
-from vllm.distributed.utils import get_shard_spec
 
 class Attention(nn.Module):
     """Attention layer.

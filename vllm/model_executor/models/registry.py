@@ -451,8 +451,8 @@ class _ModelRegistry:
         self,
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
-        breakpoint()
         architectures = self._normalize_archs(architectures)
+        print(f"hosseins: [{architectures=}]")
 
         for arch in architectures:
             model_cls = self._try_load_model_cls(arch)

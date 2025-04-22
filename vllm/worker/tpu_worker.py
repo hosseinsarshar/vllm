@@ -20,8 +20,6 @@ from vllm.worker.tpu_model_runner import ExecutionMode, TPUModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
                                      LoRANotSupportedWorkerBase, WorkerBase,
                                      WorkerInput)
-from vllm.distributed.utils import initialize_spmd
-from vllm.distributed.utils import initialize_spmd, get_device_ids, shard_spmd, get_col_parallel_partition_spec, is_spmd, get_shard_spec, get_row_parallel_partition_spec
 
 logger = init_logger(__name__)
 
@@ -42,7 +40,6 @@ class TPUWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
-        initialize_spmd()
 
         assert self.device_config.device_type == "tpu"
         if self.cache_config.cache_dtype == "auto":
@@ -205,9 +202,7 @@ class TPUWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             tpu_k_cache = torch.zeros(tpu_cache_shape,
                                       dtype=dtype,
                                       device=self.device)
-            shard_spmd(data=tpu_k_cache, partition_spec=((None, None) + get_row_parallel_partition_spec()))
             tpu_v_cache = torch.zeros_like(tpu_k_cache)
-            shard_spmd(data=tpu_v_cache, partition_spec=((None, None) + get_row_parallel_partition_spec()))
             self.tpu_cache.append((tpu_k_cache, tpu_v_cache))
             cpu_k_cache = torch.zeros(cpu_cache_shape,
                                       dtype=dtype,
@@ -325,7 +320,6 @@ def _make_src_to_dst(
                                dtype=torch.int64)
     return src_indices, dst_indices
 
-# hosseins: torch.compile
 @torch.compile(backend="openxla")
 def _insert_kv(
     k: torch.Tensor,

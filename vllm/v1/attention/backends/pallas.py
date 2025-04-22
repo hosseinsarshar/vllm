@@ -16,7 +16,6 @@ import torch.nn.functional as F
 # These are the 2 tunable parameters of the paged attention Pallas kernel.
 NUM_QUERIES_PER_BLOCK = 32
 NUM_KV_PAGES_PER_BLOCK = 128
-from vllm.distributed.utils import get_shard_spec, is_spmd, disable_manual_sharding_wrapper, enable_manual_sharding_wrapper, get_device_ids
 import torch_xla.debug.profiler as xp
 import torch_xla.distributed.spmd as xs
 
@@ -133,15 +132,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
     def forward(
         self,
         layer: AttentionLayer,
-        query_org: torch.Tensor,
-        key_org: torch.Tensor,
-        value_org: torch.Tensor,
-        kv_cache_org: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
         attn_metadata: PallasMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # print("hosseins: PallasAttentionBackendImpl.forward()")
-        
         """Forward pass with Pallas attention.
 
         Args:
@@ -153,20 +150,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        if kv_cache_org.numel() == 0:
+        if kv_cache.numel() == 0:
             if output is None:
-                output = torch.ones_like(query_org)
+                output = torch.ones_like(query)
             return output
 
-        key = enable_manual_sharding_wrapper(key_org, partition_spec_str="(None, 'axis')")
-        query = enable_manual_sharding_wrapper(query_org, partition_spec_str="(None, 'axis')")
-        value = enable_manual_sharding_wrapper(value_org, partition_spec_str="(None, 'axis')")
-        kv_cache = enable_manual_sharding_wrapper(kv_cache_org, partition_spec_str="(None, None, 'axis', None)")
-
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
-        num_tokens, hidden_size = query_org.shape
-        device_ids = get_device_ids()
-        query = query.view(num_tokens, max(1, self.num_heads // len(device_ids)) if (is_spmd() and True) else self.num_heads, self.head_size)
+        num_tokens, hidden_size = query.shape
+        query = query.view(num_tokens, self.num_heads, self.head_size)
 
         if kv_cache.numel() > 0:
             slot_mapping = attn_metadata.slot_mapping
@@ -185,9 +176,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             use_kernel=True,
             sm_scale=self.scale)
         
-        output_shape = output.shape
-        merged_output = disable_manual_sharding_wrapper(tensor=output, partition_spec_str="(None, 'axis', None)", full_shape=[output_shape[0], output_shape[1] * len(device_ids), output_shape[2]])
-        true_out = merged_output.reshape(num_tokens, hidden_size)
+        true_out = output.reshape(num_tokens, hidden_size)
         return true_out
 
 
@@ -203,8 +192,8 @@ def write_to_kv_cache(
         key: shape = [num_tokens, num_kv_heads * head_size]
         value: shape = [num_tokens, num_kv_heads *  head_size]
         kv_cache = [num_blocks, block_size, num_kv_heads * 2, head_size]
-
     """
+    
     _, _, num_combined_kv_heads, head_size = kv_cache.shape
     num_kv_heads = num_combined_kv_heads // 2
     # print(f"hosseins: write_to_kv_cache() 1 {get_shard_spec(key)=} {key.shape=}")

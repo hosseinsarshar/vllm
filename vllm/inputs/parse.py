@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Sequence
-from typing import Literal, Optional, TypedDict, Union, cast, overload
+from typing import Literal, TypedDict, Union, cast, overload, Optional
 
 from typing_extensions import TypeIs
 
 from vllm.utils import is_list_of
 
-from .data import (ExplicitEncoderDecoderPrompt, ProcessorInputs, PromptType,
-                   SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt)
+from .data import (EncoderDecoderInputs, ExplicitEncoderDecoderPrompt,
+                   ProcessorInputs, PromptType, SingletonPrompt, TextPrompt,
+                   TokensPrompt)
 
 
 class ParsedText(TypedDict):
@@ -106,6 +108,14 @@ def is_token_prompt(prompt: PromptType) -> TypeIs[TokensPrompt]:
 def is_explicit_encoder_decoder_prompt(
         prompt: PromptType) -> TypeIs[ExplicitEncoderDecoderPrompt]:
     return isinstance(prompt, dict) and "encoder_prompt" in prompt
+
+
+def is_encoder_decoder_inputs(
+        inputs: ProcessorInputs) -> TypeIs[EncoderDecoderInputs]:
+    return "encoder" in inputs and "decoder" in inputs
+
+from .data import (ExplicitEncoderDecoderPrompt, ProcessorInputs, PromptType,
+                   SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt)
 
 
 def split_enc_dec_inputs(

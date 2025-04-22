@@ -139,6 +139,8 @@ class LLMEngine:
             enable_multiprocessing = True
 
         # Create the LLMEngine.
+        print(f"hosseins: [{cls=}]")
+        print(f"hosseins: [{executor_class=}]")
         return cls(vllm_config=vllm_config,
                    executor_class=executor_class,
                    log_stats=not engine_args.disable_log_stats,

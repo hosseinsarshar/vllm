@@ -15,8 +15,6 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.distributed.utils import get_mesh, get_col_parallel_partition_spec, get_row_parallel_partition_spec, shard_spmd, get_shard_spec
-import torch_xla.debug.profiler as xp
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -237,8 +235,6 @@ class VocabParallelEmbedding(torch.nn.Module):
                                                self.tp_size)
         self.embedding_dim = embedding_dim
 
-        self.mesh = get_mesh()
-
         quant_method = None
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
@@ -280,8 +276,6 @@ class VocabParallelEmbedding(torch.nn.Module):
                                          self.num_embeddings_padded,
                                          params_dtype=params_dtype,
                                          weight_loader=self.weight_loader)
-        shard_spmd(data=self.weight, mesh=self.mesh, partition_spec=get_col_parallel_partition_spec())
-        
 
     @classmethod
     def _get_indices(cls, vocab_size_padded: int, org_vocab_size_padded: int,
@@ -370,7 +364,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         if getattr(param, "is_gguf_weight_type", None):
             param.data.copy_(loaded_weight)
             param.weight_type = loaded_weight.item()
-            shard_spmd(data=param.data, mesh=self.mesh, partition_spec=get_col_parallel_partition_spec())
             return
         elif isinstance(param, UninitializedParameter):
             shape = list(loaded_weight.shape)
@@ -383,7 +376,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         if output_dim is None:
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
-            shard_spmd(data=param.data, mesh=self.mesh, partition_spec=get_col_parallel_partition_spec())
 
             return
 
@@ -422,7 +414,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             param[:loaded_weight.shape[0]].data.copy_(loaded_weight)
             param[loaded_weight.shape[0]:].data.fill_(0)
 
-        shard_spmd(data=param.data, mesh=self.mesh, partition_spec=get_col_parallel_partition_spec())
 
     def forward(self, input_):
         # print(f"hosseins: VocabParallelEmbedding.forward() [{input_.shape}]")

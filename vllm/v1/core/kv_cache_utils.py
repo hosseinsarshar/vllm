@@ -15,8 +15,6 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
-from vllm.distributed.utils import get_device_ids, is_spmd
-
 logger = init_logger(__name__)
 
 
@@ -568,7 +566,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     # print(f"hosseins: {available_memory=}")
     print(f"hosseins: {available_memory=}")
     #  * max(1, len(get_device_ids()))
-    effective_available_memory = available_memory if not is_spmd() else available_memory * max(1, len(get_device_ids()))
+    # hosseins: fix the device length
+    effective_available_memory = available_memory * max(1, 4)
     print(f"hosseins: {effective_available_memory=}")
 
     num_blocks = int(effective_available_memory // page_size // len(kv_cache_spec))

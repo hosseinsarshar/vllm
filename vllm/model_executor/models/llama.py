@@ -53,8 +53,9 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-from vllm.distributed.utils import get_shard_spec, get_torch_tensor_gbytes
+from vllm.distributed.utils import get_torch_tensor_gbytes
 import torch_xla.debug.profiler as xp
+from vllm.distributed.tpu_gspmd_backend import SPMDBackend
 
 class LlamaMLP(nn.Module):
 
@@ -447,6 +448,7 @@ class LlamaModel(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        # breakpoint()
         for name, loaded_weight in weights:
             print(f"hosseins: DefaultModelLoader -> load_weights() {name=}")
             if "rotary_emb.inv_freq" in name:
@@ -502,15 +504,16 @@ class LlamaModel(nn.Module):
             loaded_params.add(name)
 
         # print("hosseins: load_weights() is completed")
-
+        # breakpoint()
         print("hosseins: ============================= Layers Loaded =============================")
 
         params_dict = dict(self.named_parameters())
         for params_name in dict(self.named_parameters()):
             param = params_dict[params_name]
             loaded_param_size = get_torch_tensor_gbytes(param)
-            print(f"hosseins: [{params_name}] - [{param.shape}] : [{loaded_param_size:.2f} GB] - {get_shard_spec(param)=}")
+            print(f"hosseins: [{params_name}] - [{param.shape}] : [{loaded_param_size:.2f} GB] - {SPMDBackend.get_shard_spec_string(param)=}")
 
+        # breakpoint()
         return loaded_params
 
 
@@ -552,7 +555,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        breakpoint()
+        # breakpoint()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config

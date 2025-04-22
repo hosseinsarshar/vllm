@@ -11,9 +11,7 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
 from vllm.attention.backends.utils import CommonAttentionState
-from vllm.distributed.utils import get_shard_spec, get_partition_spec, get_mesh, get_device_ids, is_spmd
 import torch_xla
-import torch_xla.distributed.spmd as xs
 
 
 class PallasAttentionBackend(AttentionBackend):

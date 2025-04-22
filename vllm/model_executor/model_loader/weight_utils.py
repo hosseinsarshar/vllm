@@ -27,7 +27,6 @@ from vllm.model_executor.layers.quantization import (QuantizationConfig,
                                                      get_quantization_config)
 from vllm.platforms import current_platform
 from vllm.utils import PlaceholderModule
-from vllm.distributed.utils import shard_spmd, get_col_parallel_partition_spec, get_mesh
 
 try:
     from runai_model_streamer import SafetensorsStreamer
@@ -604,9 +603,6 @@ def row_parallel_weight_loader(param: torch.Tensor,
         loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
 
     ret_o = default_weight_loader(param, loaded_weight)
-
-    mesh = get_mesh()
-    shard_spmd(param.data, mesh, get_col_parallel_partition_spec())
 
     return ret_o
 

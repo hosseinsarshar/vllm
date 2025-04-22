@@ -40,8 +40,6 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from .utils import sanity_check_mm_encoder_outputs
 
-from vllm.distributed.utils import shard_spmd, get_shard_spec, get_mesh
-
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 import torch_xla.debug.profiler as xp
@@ -90,8 +88,6 @@ class TPUModelRunner:
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
         self._hidden_states_dtype = self.dtype
-
-        self.mesh = get_mesh()
 
         self.is_multimodal_model = model_config.is_multimodal_model
         self.sliding_window = model_config.get_sliding_window()
@@ -909,16 +905,15 @@ class TPUModelRunner:
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
 
+        kv_caches: dict[str, torch.Tensor] = self.create_kv_cache(kv_cache_config)
+        
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches)
+
+    def create_kv_cache(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         kv_caches: dict[str, torch.Tensor] = {}
-        # print(f"hosseins: initialize_kv_cache() {kv_cache_config=}")
-
-        # # print(f"hosseins: {len(kv_cache_config.kv_cache_spec)=}")
-        # print(f"hosseins: {kv_cache_config.num_blocks=}")
-        # print(f"hosseins: {len(kv_cache_config.tensors)=}")
-        # # print(f"hosseins: {len(kv_cache_config.groups)=}")
-
-        # # print(f"hosseins: {len(kv_cache_config.kv_cache_spec.items())=}")
-
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
@@ -931,29 +926,13 @@ class TPUModelRunner:
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
                     dtype = kv_cache_spec.dtype
 
-
-
-                    # print(f"hosseins: [{kv_cache_shape=}]")
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype,
                                                device=self.device)
-                    shard_spmd(data=tpu_kv_cache, mesh=self.mesh, partition_spec=(None, None, 'axis', None))
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
-                
-                # print(f"hosseins: ============================= {layer_name} =============================")
-                # print(f"hosseins: {num_blocks=}")
-                # print(f"hosseins: {kv_cache_spec=}")
-                # # print(f"hosseins: {layer_spec.num_kv_heads=}")
-                # # print(f"hosseins: {layer_spec.head_size=}")
-
-        # print(f"hosseins: initialize_kv_cache() {kv_cache_config=}")
-        bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
-
+        return kv_caches
 
 class ModelWrapperV1(nn.Module):
 

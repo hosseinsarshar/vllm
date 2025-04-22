@@ -115,7 +115,7 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_config = vllm_config.model_config
     model_class, _ = get_model_architecture(model_config)
-
+    # apply_linear_layer_patches()
     if vllm_config.quant_config is not None:
         configure_quant_config(vllm_config.quant_config, model_class)
 
@@ -1484,7 +1484,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     """Get a model loader based on the load format."""
-    # print(f"hosseins: get_model_loader() {load_config.load_format=}")
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
 

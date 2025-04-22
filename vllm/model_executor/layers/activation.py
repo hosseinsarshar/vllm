@@ -13,8 +13,6 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
-from vllm.distributed.utils import shard_spmd, get_row_parallel_partition_spec, get_mesh
-
 
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -307,7 +305,6 @@ class ScaledActivation(nn.Module):
         self.scales = nn.Parameter(
             torch.empty(intermediate_size_per_partition, dtype=params_dtype))
         set_weight_attrs(self.scales, {"weight_loader": self.weight_loader})
-        self.mesh = get_mesh()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(x) / self.scales
@@ -322,8 +319,6 @@ class ScaledActivation(nn.Module):
             loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
-        shard_spmd(param, self.mesh, get_row_parallel_partition_spec())
-
 
 _ACTIVATION_REGISTRY = LazyDict({
     "gelu":
