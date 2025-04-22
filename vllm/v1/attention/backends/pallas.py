@@ -157,6 +157,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         num_tokens, hidden_size = query.shape
+        
         query = query.view(num_tokens, self.num_heads, self.head_size)
 
         if kv_cache.numel() > 0:

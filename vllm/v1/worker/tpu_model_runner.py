@@ -906,7 +906,7 @@ class TPUModelRunner:
                 "supported yet.")
 
         kv_caches: dict[str, torch.Tensor] = self.create_kv_cache(kv_cache_config)
-        
+
         bind_kv_cache(
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,

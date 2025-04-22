@@ -1,6 +1,6 @@
 import os
-import time
 import torch
+import contextlib
 import numpy as np
 from vllm.logger import init_logger
 from torch.library import impl, custom_op
@@ -8,9 +8,11 @@ from typing import Union, Tuple, Optional, List
 from vllm.model_executor.layers.linear import (RowParallelLinear,
                                                ColumnParallelLinear)
 from vllm.v1.worker.tpu_model_runner import TPUModelRunner
-from vllm.v1.attention.backends.pallas import PallasAttentionBackendImpl
+from vllm.v1.attention.backends.pallas import PallasAttentionBackendImpl, write_to_kv_cache, NUM_KV_PAGES_PER_BLOCK, NUM_QUERIES_PER_BLOCK
 import functools
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
+                                              AttentionLayer, AttentionType)
 # Define Type Alias at module level
 
 logger = init_logger(__name__)
@@ -225,9 +227,9 @@ class SPMDBackend:
             _spmd_backend = spmd_backend()
             for layer in kv_caches:
                 kv_cache = kv_caches[layer]
-                print(f"hosseins: [{layer=}]:[{type(kv_cache)=}]")
-                print(f"hosseins: [{layer=}]:[{type(kv_cache)=}] - [{kv_cache.shape=}]")
-                time.sleep(1)
+                # print(f"hosseins: [{layer=}]:[{type(kv_cache)=}]")
+                # print(f"hosseins: [{layer=}]:[{type(kv_cache)=}] - [{kv_cache.shape=}]")
+                
                 _spmd_backend.shard_spmd(kv_cache, partition_spec=SPMDBackend.kv_cache_parallel_spec(), mark_step=False)
             
             xm.mark_step()
@@ -242,17 +244,26 @@ class SPMDBackend:
         original_forward = PallasAttentionBackendImpl.forward
 
         @functools.wraps(original_forward)
-        def wrapped_forward(self, *args, **kwargs):
-            kwargs["key"] = enable_manual_sharding_wrapper(kwargs["key"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
-            kwargs["query"] = enable_manual_sharding_wrapper(kwargs["query"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
-            kwargs["value"] = enable_manual_sharding_wrapper(kwargs["value"], partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
-            kwargs["kv_cache"] = enable_manual_sharding_wrapper(kwargs["kv_cache"], partition_spec_str=f"{SPMDBackend.kv_cache_parallel_spec()}")
+        def wrapped_forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None):
+            return spmd_pallas_forward(self, layer, query, key, value, kv_cache, attn_metadata, output)
+        
+            if kv_cache.numel() == 0:
+                if output is None:
+                    output = torch.ones_like(query)
+                return output
 
-            local_output = original_forward(self, *args, **kwargs)
-
+            num_tokens, hidden_size = query.shape
+            key_shard = enable_manual_sharding_wrapper(key, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            query_shard = enable_manual_sharding_wrapper(query, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            value_shard = enable_manual_sharding_wrapper(value, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}")
+            kv_cache_shard = enable_manual_sharding_wrapper(kv_cache, partition_spec_str=f"{SPMDBackend.kv_cache_parallel_spec()}")
+            
             _spmd_backend = spmd_backend()
 
-            merged_output = disable_manual_sharding_wrapper(tensor=local_output, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}", full_shape=[local_output.shape[0], local_output.shape[0] * len(_spmd_backend.device_ids)])
+            with temp_attr_value_gen(self, 'num_heads', self.num_heads // len(_spmd_backend.device_ids)):
+                local_output = original_forward(self, layer, query_shard, key_shard, value_shard, kv_cache_shard, attn_metadata, output)
+
+            merged_output = disable_manual_sharding_wrapper(tensor=local_output, partition_spec_str=f"{SPMDBackend.row_parallel_spec()}", full_shape=[num_tokens, hidden_size])
             return merged_output
 
         PallasAttentionBackendImpl.forward = wrapped_forward
@@ -276,7 +287,7 @@ class SPMDBackend:
             SPMDBackend.patch_init(cls)
 
         SPMDBackend.patch_kv_cache()
-        # SPMDBackend.patch_pallas_forward()
+        SPMDBackend.patch_pallas_forward()
 
 
 _SPMD_BACKEND: Optional[SPMDBackend] = None
@@ -287,14 +298,12 @@ def spmd_backend() -> SPMDBackend:
     if not SPMDBackend.is_spmd():
         return None
     
-    print(f"hosseins: spmd_backend-> [{_SPMD_BACKEND=}]")
     assert _SPMD_BACKEND is not None, ("SPMD Backend is not initialized")
     return _SPMD_BACKEND
 
 def init_spmd_backend() -> SPMDBackend:
     global _SPMD_BACKEND
     _SPMD_BACKEND = SPMDBackend()
-    print(f"hosseins: init_spmd_backend-> [{_SPMD_BACKEND=}]")
     return _SPMD_BACKEND
 
 if TORCH_XLA_AVAILABLE:
@@ -346,7 +355,65 @@ if TORCH_XLA_AVAILABLE:
     def disable_manual_sharding_wrapper_fake(tensor: torch.Tensor, partition_spec_str: str, full_shape: List[int]):
         # Fake logic (unchanged)
         if full_shape is None: raise ValueError("full_shape cannot be None")
-        if not isinstance(full_shape, (list, tuple)) or not all(isinstance(dim, int) for dim in full_shape):
-            raise TypeError(f"full_shape must be a list or tuple of integers, got {full_shape}")
+        
         return torch.empty(tuple(full_shape), dtype=tensor.dtype, device=tensor.device)
 
+
+    @contextlib.contextmanager
+    def temp_attr_value_gen(obj, attr_name, temp_value):
+        original_value = getattr(obj, attr_name)
+        try:
+            setattr(obj, attr_name, temp_value)
+            yield
+        finally:
+            setattr(obj, attr_name, original_value)
+
+    def spmd_pallas_forward(
+        self,
+        layer,
+        query_org,
+        key_org,
+        value_org,
+        kv_cache_org,
+        attn_metadata,
+        output = None,
+    ) -> torch.Tensor:
+        if kv_cache_org.numel() == 0:
+            if output is None:
+                output = torch.ones_like(query_org)
+            return output
+
+        key = enable_manual_sharding_wrapper(key_org, partition_spec_str="(None, 'axis')")
+        query = enable_manual_sharding_wrapper(query_org, partition_spec_str="(None, 'axis')")
+        value = enable_manual_sharding_wrapper(value_org, partition_spec_str="(None, 'axis')")
+        kv_cache = enable_manual_sharding_wrapper(kv_cache_org, partition_spec_str="(None, None, 'axis', None)")
+
+        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
+        num_tokens, hidden_size = query_org.shape
+        
+        _spmd_backend = spmd_backend()
+
+        spmd_device_size = len(_spmd_backend.device_ids)
+        query = query.view(num_tokens, max(1, self.num_heads // spmd_device_size), self.head_size)
+
+        if kv_cache.numel() > 0:
+            slot_mapping = attn_metadata.slot_mapping
+            write_to_kv_cache(key, value, kv_cache, slot_mapping)
+
+        output = torch.ops.xla.ragged_paged_attention(
+            query,
+            kv_cache,
+            attn_metadata.context_lens,
+            attn_metadata.block_tables,
+            attn_metadata.query_start_loc,
+            attn_metadata.num_seqs,
+            num_kv_pages_per_block=NUM_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=NUM_QUERIES_PER_BLOCK,
+            vmem_limit_bytes=self.vmem_limit_bytes,
+            use_kernel=True,
+            sm_scale=self.scale)
+
+        output_shape = output.shape
+        merged_output = disable_manual_sharding_wrapper(tensor=output, partition_spec_str="(None, 'axis', None)", full_shape=[output_shape[0], output_shape[1] * spmd_device_size, output_shape[2]])
+        true_out = merged_output.reshape(num_tokens, hidden_size)
+        return true_out
