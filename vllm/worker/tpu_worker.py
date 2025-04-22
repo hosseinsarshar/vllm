@@ -107,10 +107,13 @@ class TPUWorker(LoRANotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             xr.initialize_cache(per_rank_path, readonly=False)
 
         self.profiler = None
-        if envs.VLLM_TORCH_PROFILER_DIR and self.rank < 1:
+        vllm_profiler_path = "gs://hosseins-asia-northeast1-bucket/vllm/profile-spmd-no-write"
+        print(f"hosseins: [{self.rank=}]")
+        print(f"hosseins: [{vllm_profiler_path=}]")
+        if self.rank < 1:
             # For TPU, we can only have 1 active profiler session for 1 profiler
             # server. So we only profile on rank0.
-            self.profile_dir = envs.VLLM_TORCH_PROFILER_DIR
+            self.profile_dir = vllm_profiler_path
             logger.info("Profiling enabled. Traces will be saved to: %s",
                         self.profile_dir)
             self.profiler = xp.start_server(9012)

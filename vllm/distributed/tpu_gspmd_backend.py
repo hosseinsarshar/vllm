@@ -40,13 +40,6 @@ except ImportError:
 class SPMDBackend:
     """
     Encapsulates SPMD (Single Program, Multiple Data) logic using torch_xla.
-    Manages mesh and device IDs as instance attributes, initialized on creation.
-
-    Attributes:
-        mesh (Optional[Mesh]): The initialized SPMD mesh, if successful. Read-only property.
-        device_ids (Optional[np.ndarray]): NumPy array of device IDs, if available. Read-only property.
-        col_parallel_spec (PartitionSpec): Standard partition spec for column parallelism. Read-only property.
-        row_parallel_spec (PartitionSpec): Standard partition spec for row parallelism. Read-only property.
     """
     _mesh: Optional["Mesh"] = None
     _device_ids: Optional[np.ndarray] = np.array(list(range(0, 4)))
@@ -227,8 +220,6 @@ class SPMDBackend:
             _spmd_backend = spmd_backend()
             for layer in kv_caches:
                 kv_cache = kv_caches[layer]
-                # print(f"hosseins: [{layer=}]:[{type(kv_cache)=}]")
-                # print(f"hosseins: [{layer=}]:[{type(kv_cache)=}] - [{kv_cache.shape=}]")
                 
                 _spmd_backend.shard_spmd(kv_cache, partition_spec=SPMDBackend.kv_cache_parallel_spec(), mark_step=False)
             
@@ -396,9 +387,9 @@ if TORCH_XLA_AVAILABLE:
         spmd_device_size = len(_spmd_backend.device_ids)
         query = query.view(num_tokens, max(1, self.num_heads // spmd_device_size), self.head_size)
 
-        if kv_cache.numel() > 0:
-            slot_mapping = attn_metadata.slot_mapping
-            write_to_kv_cache(key, value, kv_cache, slot_mapping)
+        # if kv_cache.numel() > 0:
+        #     slot_mapping = attn_metadata.slot_mapping
+        #     write_to_kv_cache(key, value, kv_cache, slot_mapping)
 
         output = torch.ops.xla.ragged_paged_attention(
             query,
