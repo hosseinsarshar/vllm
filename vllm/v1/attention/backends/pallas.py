@@ -217,4 +217,4 @@ def write_to_kv_cache(
 
     torch.ops.xla.dynamo_set_buffer_donor_(kv_cache, True)
     kv_cache = kv_cache.flatten(0, 1)
-    # kv_cache.index_copy_(0, slot_mapping, kv)
+    kv_cache.index_copy_(0, slot_mapping, kv)
