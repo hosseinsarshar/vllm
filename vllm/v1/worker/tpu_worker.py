@@ -23,7 +23,8 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.tpu_model_runner import TPUModelRunner
-
+from vllm.distributed.tpu_gspmd_backend import init_spmd_backend
+from vllm.utils import get_tpu_info
 logger = init_logger(__name__)
 
 
@@ -172,7 +173,7 @@ class TPUWorker:
 
         # Get the maximum amount of memory used by the model weights and
         # intermediate activations.
-        m = xm.get_memory_info(self.device)
+        m = get_tpu_info(0)
         total_memory_size = m["bytes_limit"]
         current_mem = m["bytes_used"]
         # Ideally we would use profiled = m["peak_bytes_used"] to
@@ -254,3 +255,6 @@ def init_tpu_worker_distributed_environment(
     )
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    
+    # SPMD Backend is a new experimental feature - it is not active by default, you can activate it by setting USE_SPMD=1
+    init_spmd_backend()
