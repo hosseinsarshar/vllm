@@ -1203,15 +1203,22 @@ class TPUModelRunner:
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
 
-        kv_caches: dict[str, torch.Tensor] = {}
+        kv_caches: dict[str, torch.Tensor] = self.create_kv_cache(kv_cache_config)
 
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            self.kv_caches)
+
+    def create_kv_cache(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+        kv_caches: dict[str, torch.Tensor] = {}
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
                 tensor_config = kv_cache_config.tensors[layer_name]
                 assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
                 num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
-                if isinstance(kv_cache_spec, AttentionSpec):
+                if isinstance(kv_cache_spec, FullAttentionSpec):
                     kv_cache_shape = PallasAttentionBackend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
@@ -1220,15 +1227,10 @@ class TPUModelRunner:
                     tpu_kv_cache = torch.zeros(kv_cache_shape,
                                                dtype=dtype,
                                                device=self.device)
-
                     kv_caches[layer_name] = tpu_kv_cache
                 else:
                     raise NotImplementedError
-
-        bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+        return kv_caches
 
     def reset_dynamo_cache(self):
         if self.is_multimodal_model:
