@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache, report_usage_stats
 from vllm.v1.worker.tpu_model_runner import TPUModelRunner
+from vllm.distributed.tpu_gspmd_backend import init_spmd_backend
 
 logger = init_logger(__name__)
 
@@ -258,3 +259,4 @@ def init_tpu_worker_distributed_environment(
     )
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+    init_spmd_backend()
