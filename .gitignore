@@ -12,6 +12,8 @@ __pycache__/
 # C extensions
 *.so
 
+script.sh
+benchmarks/sonnet_4x.txt
 # Distribution / packaging
 .Python
 build/
